@@ -38,7 +38,7 @@ Save YouTube OAuth client credentials in the existing config:
 Then create the `ytmusicapi` OAuth file:
 
 ```bash
-ytmusicapi oauth ~/.config/niri/scripts/ytmusic-oauth.json
+~/.config/niri/scripts/ytm-lastfm-sync setup-oauth
 ```
 
 As of ytmusicapi 1.12, OAuth requires a YouTube Data API OAuth client id and secret. ytmusicapi recommends an OAuth client ID of type `TVs and Limited Input devices`.
@@ -51,6 +51,15 @@ Start small:
 ./ytm-lastfm-sync export-liked --limit 25
 ./ytm-lastfm-sync sync --preview 25
 ```
+
+If `export-liked` fails with HTTP 400 from YouTube Music, use the official YouTube Data API fallback:
+
+```bash
+./ytm-lastfm-sync export-youtube-liked --limit 25
+./ytm-lastfm-sync sync --export exports/youtube_liked_videos.raw.json --preview 25
+```
+
+This fallback exports all liked YouTube videos, not only YouTube Music library songs. It marks `Artist - Topic` channels as ready and sends other videos to `review.csv`.
 
 This creates:
 
@@ -67,6 +76,12 @@ Rows in `ready.csv` have enough metadata for a conservative Last.fm `track.love`
 
 ```bash
 ./ytm-lastfm-sync export-liked --limit all
+```
+
+Fallback full export:
+
+```bash
+./ytm-lastfm-sync export-youtube-liked --limit all
 ```
 
 For thousands of likes this may take a while. If it fails, rerun the command; it overwrites the local export.

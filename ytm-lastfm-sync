@@ -20,6 +20,8 @@ from pathlib import Path
 
 
 LASTFM_API_URL = "https://ws.audioscrobbler.com/2.0/"
+GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+YOUTUBE_VIDEOS_URL = "https://www.googleapis.com/youtube/v3/videos"
 DEFAULT_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "niri/scripts/lastfm-love.env"
 DEFAULT_YTM_OAUTH = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "niri/scripts/ytmusic-oauth.json"
 DEFAULT_OUT_DIR = Path("exports")
@@ -87,6 +89,14 @@ def import_ytmusicapi():
     return OAuthCredentials, YTMusic
 
 
+def import_ytmusicapi_setup():
+    try:
+        from ytmusicapi.setup import setup_oauth
+    except ImportError:
+        die("missing dependency: ytmusicapi")
+    return setup_oauth
+
+
 def ytmusic_client(config_path, oauth_path):
     OAuthCredentials, YTMusic = import_ytmusicapi()
     config = read_env_file(config_path)
@@ -100,6 +110,45 @@ def ytmusic_client(config_path, oauth_path):
         str(oauth_path),
         oauth_credentials=OAuthCredentials(client_id=client_id, client_secret=client_secret),
     )
+
+
+def google_access_token(config_path, oauth_path):
+    config = read_env_file(config_path)
+    client_id = config.get("YTMUSIC_CLIENT_ID") or os.environ.get("YTMUSIC_CLIENT_ID")
+    client_secret = config.get("YTMUSIC_CLIENT_SECRET") or os.environ.get("YTMUSIC_CLIENT_SECRET")
+    if not client_id or not client_secret:
+        die(f"missing YTMUSIC_CLIENT_ID/YTMUSIC_CLIENT_SECRET in {config_path}")
+    if not oauth_path.exists():
+        die(f"missing OAuth file: {oauth_path}. Run: ytm-lastfm-sync setup-oauth")
+
+    data = json.loads(oauth_path.read_text(encoding="utf-8"))
+    if data.get("access_token") and data.get("expires_at", 0) > time.time() + 60:
+        return data["access_token"]
+
+    refresh_token = data.get("refresh_token")
+    if not refresh_token:
+        die(f"missing refresh_token in {oauth_path}. Run: ytm-lastfm-sync setup-oauth")
+
+    body = urllib.parse.urlencode(
+        {
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "refresh_token": refresh_token,
+            "grant_type": "refresh_token",
+        }
+    ).encode("utf-8")
+    request = urllib.request.Request(GOOGLE_TOKEN_URL, data=body, method="POST")
+    with urllib.request.urlopen(request, timeout=30) as response:
+        refreshed = json.loads(response.read().decode("utf-8"))
+    if "access_token" not in refreshed:
+        die(f"Google did not return an access token: {refreshed}")
+
+    data.update(refreshed)
+    if "expires_in" in refreshed:
+        data["expires_at"] = int(time.time()) + int(refreshed["expires_in"])
+    oauth_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    oauth_path.chmod(0o600)
+    return data["access_token"]
 
 
 def normalize_track(item):
@@ -126,6 +175,7 @@ def normalize_track(item):
         "MUSIC_VIDEO_TYPE_ATV",
         "MUSIC_VIDEO_TYPE_OMV",
         "MUSIC_VIDEO_TYPE_OFFICIAL_SOURCE_MUSIC",
+        "YOUTUBE_TOPIC",
     }:
         issues.append(f"video_type:{video_type}")
     suspicious_title = any(
@@ -147,6 +197,26 @@ def normalize_track(item):
         "is_available": is_available,
         "ready": not issues,
         "issues": ";".join(issues),
+    }
+
+
+def youtube_video_to_track(item):
+    snippet = item.get("snippet") or {}
+    channel_title = (snippet.get("channelTitle") or "").strip()
+    title = (snippet.get("title") or "").strip()
+    artist = channel_title.removesuffix(" - Topic").strip()
+    is_topic = channel_title.endswith(" - Topic")
+    return {
+        "videoId": item.get("id") or "",
+        "title": title,
+        "artists": [{"name": artist}] if artist else [],
+        "album": {},
+        "duration_seconds": "",
+        "likeStatus": "LIKE",
+        "videoType": "YOUTUBE_TOPIC" if is_topic else "YOUTUBE_VIDEO",
+        "isAvailable": True,
+        "source": "youtube_data_api",
+        "channelTitle": channel_title,
     }
 
 
@@ -275,7 +345,25 @@ def cmd_setup_youtube(args):
     write_config_value(config_path, "YTMUSIC_CLIENT_SECRET", client_secret)
     print(f"Saved YouTube Music client credentials in {config_path}.")
     print("Now run:")
-    print(f"  ytmusicapi oauth {Path(args.oauth).expanduser()}")
+    print(f"  ytm-lastfm-sync setup-oauth")
+
+
+def cmd_setup_oauth(args):
+    setup_oauth = import_ytmusicapi_setup()
+    config_path = Path(args.config).expanduser()
+    oauth_path = Path(args.oauth).expanduser()
+    config = read_env_file(config_path)
+    client_id = config.get("YTMUSIC_CLIENT_ID") or os.environ.get("YTMUSIC_CLIENT_ID")
+    client_secret = config.get("YTMUSIC_CLIENT_SECRET") or os.environ.get("YTMUSIC_CLIENT_SECRET")
+    if not client_id or not client_secret:
+        die(f"missing YTMUSIC_CLIENT_ID/YTMUSIC_CLIENT_SECRET in {config_path}")
+    oauth_path.parent.mkdir(parents=True, exist_ok=True)
+    setup_oauth(
+        client_id=client_id,
+        client_secret=client_secret,
+        filepath=str(oauth_path),
+        open_browser=True,
+    )
 
 
 def cmd_export_liked(args):
@@ -291,6 +379,57 @@ def cmd_export_liked(args):
     rows = [normalize_track(item) for item in tracks]
     all_path, ready_path, review_path = write_normalized(rows, out_dir)
     print(f"Fetched {len(tracks)} liked tracks.")
+    print(f"Raw export: {raw_path}")
+    print(f"Normalized: {all_path}")
+    print(f"Ready: {ready_path}")
+    print(f"Needs review: {review_path}")
+
+
+def cmd_export_youtube_liked(args):
+    limit = None if args.limit == "all" else int(args.limit)
+    out_dir = Path(args.out_dir).expanduser()
+    config_path = Path(args.config).expanduser()
+    oauth_path = Path(args.oauth).expanduser()
+    token = google_access_token(config_path, oauth_path)
+
+    items = []
+    page_token = ""
+    print(f"Fetching YouTube liked videos with limit={args.limit}...")
+    while True:
+        remaining = None if limit is None else limit - len(items)
+        if remaining is not None and remaining <= 0:
+            break
+        max_results = 50 if remaining is None else min(50, remaining)
+        params = {
+            "part": "snippet,contentDetails",
+            "myRating": "like",
+            "maxResults": str(max_results),
+        }
+        if page_token:
+            params["pageToken"] = page_token
+        request = urllib.request.Request(YOUTUBE_VIDEOS_URL + "?" + urllib.parse.urlencode(params))
+        request.add_header("Authorization", f"Bearer {token}")
+        with urllib.request.urlopen(request, timeout=30) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        batch = data.get("items", [])
+        items.extend(batch)
+        print(f"Fetched {len(items)} videos...", flush=True)
+        page_token = data.get("nextPageToken") or ""
+        if not page_token or not batch:
+            break
+        time.sleep(args.sleep)
+
+    tracks = [youtube_video_to_track(item) for item in items]
+    rows = [normalize_track(item) for item in tracks]
+    for row, item in zip(rows, tracks):
+        if item.get("videoType") != "YOUTUBE_TOPIC":
+            row["ready"] = False
+            row["issues"] = ";".join(filter(None, [row["issues"], "not_topic_channel"]))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    raw_path = out_dir / "youtube_liked_videos.raw.json"
+    raw_path.write_text(json.dumps({"items": items, "tracks": tracks}, ensure_ascii=False, indent=2), encoding="utf-8")
+    all_path, ready_path, review_path = write_normalized(rows, out_dir)
+    print(f"Fetched {len(items)} liked videos.")
     print(f"Raw export: {raw_path}")
     print(f"Normalized: {all_path}")
     print(f"Ready: {ready_path}")
@@ -339,10 +478,19 @@ def parser():
     setup = sub.add_parser("setup-youtube", help="Save YouTube Music OAuth client id/secret")
     setup.set_defaults(func=cmd_setup_youtube)
 
+    oauth = sub.add_parser("setup-oauth", help="Create ytmusicapi OAuth token file")
+    oauth.set_defaults(func=cmd_setup_oauth)
+
     export = sub.add_parser("export-liked", help="Export and normalize YouTube Music liked songs")
     export.add_argument("--limit", default="all", help="'all' or a number. Use 25 for a smoke test.")
     export.add_argument("--out-dir", default=str(DEFAULT_OUT_DIR), help="Output directory")
     export.set_defaults(func=cmd_export_liked)
+
+    yt_export = sub.add_parser("export-youtube-liked", help="Export liked videos with the official YouTube Data API")
+    yt_export.add_argument("--limit", default="all", help="'all' or a number. Use 25 for a smoke test.")
+    yt_export.add_argument("--out-dir", default=str(DEFAULT_OUT_DIR), help="Output directory")
+    yt_export.add_argument("--sleep", type=float, default=0.1, help="Delay between YouTube API pages")
+    yt_export.set_defaults(func=cmd_export_youtube_liked)
 
     sync = sub.add_parser("sync", help="Sync a raw export to Last.fm")
     sync.add_argument("--export", default=str(DEFAULT_OUT_DIR / "ytmusic_likes.raw.json"), help="Raw ytmusic export JSON")

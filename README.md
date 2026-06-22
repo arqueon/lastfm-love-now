@@ -103,9 +103,16 @@ There is an optional Python helper for exporting YouTube Music liked songs and s
 ```bash
 ./install.sh
 ~/.config/niri/scripts/ytm-lastfm-sync setup-youtube
-ytmusicapi oauth ~/.config/niri/scripts/ytmusic-oauth.json
+~/.config/niri/scripts/ytm-lastfm-sync setup-oauth
 ~/.config/niri/scripts/ytm-lastfm-sync export-liked --limit 25
 ~/.config/niri/scripts/ytm-lastfm-sync sync
+```
+
+If the unofficial YouTube Music endpoint returns HTTP 400, use the official YouTube Data API fallback:
+
+```bash
+~/.config/niri/scripts/ytm-lastfm-sync export-youtube-liked --limit 25
+~/.config/niri/scripts/ytm-lastfm-sync sync --export exports/youtube_liked_videos.raw.json
 ```
 
 For full exports:
