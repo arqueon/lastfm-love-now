@@ -4,10 +4,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 TARGET_DIR="${LASTFM_LOVE_INSTALL_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/niri/scripts}"
 TARGET_SCRIPT="$TARGET_DIR/lastfm-love-now"
+TARGET_YTM_SYNC="$TARGET_DIR/ytm-lastfm-sync"
 TARGET_ENV="$TARGET_DIR/lastfm-love.env"
 
 mkdir -p "$TARGET_DIR"
 install -m 700 "$SCRIPT_DIR/lastfm-love-now" "$TARGET_SCRIPT"
+install -m 700 "$SCRIPT_DIR/ytm-lastfm-sync" "$TARGET_YTM_SYNC"
 
 if [[ ! -e "$TARGET_ENV" ]]; then
   install -m 600 "$SCRIPT_DIR/lastfm-love.env.example" "$TARGET_ENV"
@@ -18,4 +20,5 @@ else
 fi
 
 printf 'Installed: %s\n' "$TARGET_SCRIPT"
+printf 'Installed: %s\n' "$TARGET_YTM_SYNC"
 printf 'Run setup with:\n  %s setup\n' "$TARGET_SCRIPT"

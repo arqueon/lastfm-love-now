@@ -2,3 +2,6 @@ lastfm-love.env
 *.local
 *.secret
 .env
+__pycache__/
+*.pyc
+exports/

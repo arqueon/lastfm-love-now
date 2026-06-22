@@ -1,0 +1,358 @@
+#!/usr/bin/env python3
+import argparse
+import csv
+import hashlib
+import json
+import os
+import shlex
+import sqlite3
+import sys
+import time
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+
+LASTFM_API_URL = "https://ws.audioscrobbler.com/2.0/"
+DEFAULT_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "niri/scripts/lastfm-love.env"
+DEFAULT_YTM_OAUTH = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "niri/scripts/ytmusic-oauth.json"
+DEFAULT_OUT_DIR = Path("exports")
+DEFAULT_STATE = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "niri/scripts/ytm-lastfm-sync.sqlite3"
+
+
+def die(message, code=1):
+    print(f"Error: {message}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def read_env_file(path):
+    values = {}
+    if not path.exists():
+        return values
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        try:
+            parsed = shlex.split(value, comments=False, posix=True)
+            values[key] = parsed[0] if parsed else ""
+        except ValueError:
+            values[key] = value.strip().strip('"').strip("'")
+    return values
+
+
+def require_config(path):
+    config = read_env_file(path)
+    missing = [
+        key
+        for key in ("LASTFM_API_KEY", "LASTFM_API_SECRET", "LASTFM_SESSION_KEY")
+        if not config.get(key)
+    ]
+    if missing:
+        die(f"missing {', '.join(missing)} in {path}")
+    return config
+
+
+def write_config_value(path, key, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+    quoted = shlex.quote(value)
+    written = False
+    out = []
+    for line in lines:
+        if line.startswith(f"{key}="):
+            out.append(f"{key}={quoted}")
+            written = True
+        else:
+            out.append(line)
+    if not written:
+        out.append(f"{key}={quoted}")
+    path.write_text("\n".join(out) + "\n", encoding="utf-8")
+    path.chmod(0o600)
+
+
+def import_ytmusicapi():
+    try:
+        from ytmusicapi import OAuthCredentials, YTMusic
+    except ImportError:
+        die("missing dependency: ytmusicapi. Install with: python3 -m pip install --user ytmusicapi")
+    return OAuthCredentials, YTMusic
+
+
+def ytmusic_client(config_path, oauth_path):
+    OAuthCredentials, YTMusic = import_ytmusicapi()
+    config = read_env_file(config_path)
+    client_id = config.get("YTMUSIC_CLIENT_ID") or os.environ.get("YTMUSIC_CLIENT_ID")
+    client_secret = config.get("YTMUSIC_CLIENT_SECRET") or os.environ.get("YTMUSIC_CLIENT_SECRET")
+    if not client_id or not client_secret:
+        die(f"missing YTMUSIC_CLIENT_ID/YTMUSIC_CLIENT_SECRET in {config_path}")
+    if not oauth_path.exists():
+        die(f"missing OAuth file: {oauth_path}. Run: ytmusicapi oauth")
+    return YTMusic(
+        str(oauth_path),
+        oauth_credentials=OAuthCredentials(client_id=client_id, client_secret=client_secret),
+    )
+
+
+def normalize_track(item):
+    title = (item.get("title") or "").strip()
+    artists = item.get("artists") or []
+    artist_names = [artist.get("name", "").strip() for artist in artists if artist.get("name")]
+    album = item.get("album") or {}
+    video_id = item.get("videoId") or ""
+    video_type = item.get("videoType") or ""
+    is_available = item.get("isAvailable")
+    duration_seconds = item.get("duration_seconds")
+    like_status = item.get("likeStatus") or ""
+
+    issues = []
+    if not video_id:
+        issues.append("missing_video_id")
+    if not title:
+        issues.append("missing_title")
+    if not artist_names:
+        issues.append("missing_artist")
+    if is_available is False:
+        issues.append("unavailable")
+    if video_type and video_type not in {
+        "MUSIC_VIDEO_TYPE_ATV",
+        "MUSIC_VIDEO_TYPE_OMV",
+        "MUSIC_VIDEO_TYPE_OFFICIAL_SOURCE_MUSIC",
+    }:
+        issues.append(f"video_type:{video_type}")
+    suspicious_title = any(
+        token in title.lower()
+        for token in (" live ", "(live", "official video", "lyrics", "remix", "karaoke")
+    )
+    if suspicious_title:
+        issues.append("review_title")
+
+    return {
+        "video_id": video_id,
+        "title": title,
+        "artist": artist_names[0] if artist_names else "",
+        "artists": "; ".join(artist_names),
+        "album": (album.get("name") or "").strip(),
+        "duration_seconds": duration_seconds if duration_seconds is not None else "",
+        "like_status": like_status,
+        "video_type": video_type,
+        "is_available": is_available,
+        "ready": not issues,
+        "issues": ";".join(issues),
+    }
+
+
+def load_tracks_from_export(path):
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(data, dict) and "tracks" in data:
+        return data["tracks"]
+    if isinstance(data, list):
+        return data
+    die(f"unsupported export shape in {path}")
+
+
+def write_normalized(rows, out_dir):
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "video_id",
+        "title",
+        "artist",
+        "artists",
+        "album",
+        "duration_seconds",
+        "like_status",
+        "video_type",
+        "is_available",
+        "ready",
+        "issues",
+    ]
+    ready_path = out_dir / "ytmusic_likes.ready.csv"
+    review_path = out_dir / "ytmusic_likes.review.csv"
+    all_path = out_dir / "ytmusic_likes.normalized.csv"
+
+    for path, selected in (
+        (all_path, rows),
+        (ready_path, [row for row in rows if row["ready"]]),
+        (review_path, [row for row in rows if not row["ready"]]),
+    ):
+        with path.open("w", encoding="utf-8", newline="") as fh:
+            writer = csv.DictWriter(fh, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(selected)
+    return all_path, ready_path, review_path
+
+
+def init_state(path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    conn.execute(
+        """
+        create table if not exists sync_state (
+            video_id text primary key,
+            artist text not null,
+            title text not null,
+            album text,
+            status text not null,
+            error text,
+            updated_at integer not null
+        )
+        """
+    )
+    conn.commit()
+    return conn
+
+
+def already_synced(conn, video_id):
+    row = conn.execute("select status from sync_state where video_id = ?", (video_id,)).fetchone()
+    return row and row[0] == "loved"
+
+
+def record_state(conn, row, status, error=""):
+    conn.execute(
+        """
+        insert into sync_state(video_id, artist, title, album, status, error, updated_at)
+        values (?, ?, ?, ?, ?, ?, ?)
+        on conflict(video_id) do update set
+            artist=excluded.artist,
+            title=excluded.title,
+            album=excluded.album,
+            status=excluded.status,
+            error=excluded.error,
+            updated_at=excluded.updated_at
+        """,
+        (
+            row["video_id"],
+            row["artist"],
+            row["title"],
+            row["album"],
+            status,
+            error,
+            int(time.time()),
+        ),
+    )
+    conn.commit()
+
+
+def lastfm_sig(params, secret):
+    payload = "".join(f"{key}{params[key]}" for key in sorted(params) if key not in {"format", "callback"})
+    return hashlib.md5((payload + secret).encode("utf-8")).hexdigest()
+
+
+def lastfm_love(config, artist, title):
+    params = {
+        "method": "track.love",
+        "artist": artist,
+        "track": title,
+        "api_key": config["LASTFM_API_KEY"],
+        "sk": config["LASTFM_SESSION_KEY"],
+        "format": "json",
+    }
+    params["api_sig"] = lastfm_sig(params, config["LASTFM_API_SECRET"])
+    body = urllib.parse.urlencode(params).encode("utf-8")
+    request = urllib.request.Request(LASTFM_API_URL, data=body, method="POST")
+    with urllib.request.urlopen(request, timeout=30) as response:
+        payload = response.read().decode("utf-8")
+    data = json.loads(payload) if payload else {}
+    if data.get("error"):
+        raise RuntimeError(f"{data.get('error')}: {data.get('message')}")
+
+
+def cmd_setup_youtube(args):
+    config_path = Path(args.config).expanduser()
+    client_id = input("YouTube OAuth client id: ").strip()
+    client_secret = input("YouTube OAuth client secret: ").strip()
+    if not client_id or not client_secret:
+        die("client id and secret are required")
+    write_config_value(config_path, "YTMUSIC_CLIENT_ID", client_id)
+    write_config_value(config_path, "YTMUSIC_CLIENT_SECRET", client_secret)
+    print(f"Saved YouTube Music client credentials in {config_path}.")
+    print("Now run:")
+    print(f"  ytmusicapi oauth {Path(args.oauth).expanduser()}")
+
+
+def cmd_export_liked(args):
+    limit = None if args.limit == "all" else int(args.limit)
+    out_dir = Path(args.out_dir).expanduser()
+    yt = ytmusic_client(Path(args.config).expanduser(), Path(args.oauth).expanduser())
+    print(f"Fetching YouTube Music liked songs with limit={args.limit}...")
+    data = yt.get_liked_songs(limit=limit)
+    tracks = data.get("tracks", [])
+    out_dir.mkdir(parents=True, exist_ok=True)
+    raw_path = out_dir / "ytmusic_likes.raw.json"
+    raw_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    rows = [normalize_track(item) for item in tracks]
+    all_path, ready_path, review_path = write_normalized(rows, out_dir)
+    print(f"Fetched {len(tracks)} liked tracks.")
+    print(f"Raw export: {raw_path}")
+    print(f"Normalized: {all_path}")
+    print(f"Ready: {ready_path}")
+    print(f"Needs review: {review_path}")
+
+
+def cmd_sync(args):
+    export_path = Path(args.export).expanduser()
+    rows = [normalize_track(item) for item in load_tracks_from_export(export_path)]
+    ready = [row for row in rows if row["ready"]]
+    if args.max_tracks:
+        ready = ready[: args.max_tracks]
+
+    if not args.apply:
+        for row in ready[: args.preview]:
+            print(f"DRY-RUN love: {row['artist']} - {row['title']}")
+        print(f"Dry run: {len(ready)} ready tracks would be synced. Use --apply to write to Last.fm.")
+        return
+
+    config = require_config(Path(args.config).expanduser())
+    conn = init_state(Path(args.state).expanduser())
+    loved = skipped = failed = 0
+    for row in ready:
+        if already_synced(conn, row["video_id"]):
+            skipped += 1
+            continue
+        try:
+            lastfm_love(config, row["artist"], row["title"])
+            record_state(conn, row, "loved")
+            loved += 1
+            print(f"Loved: {row['artist']} - {row['title']}")
+        except Exception as exc:
+            record_state(conn, row, "failed", str(exc))
+            failed += 1
+            print(f"Failed: {row['artist']} - {row['title']} ({exc})", file=sys.stderr)
+        time.sleep(args.sleep)
+    print(f"Done. loved={loved} skipped={skipped} failed={failed}")
+
+
+def parser():
+    root = argparse.ArgumentParser(description="Sync YouTube Music liked songs to Last.fm loved tracks.")
+    root.add_argument("--config", default=str(DEFAULT_CONFIG), help="Last.fm/YTM config env file")
+    root.add_argument("--oauth", default=str(DEFAULT_YTM_OAUTH), help="ytmusicapi oauth.json path")
+    sub = root.add_subparsers(dest="command", required=True)
+
+    setup = sub.add_parser("setup-youtube", help="Save YouTube Music OAuth client id/secret")
+    setup.set_defaults(func=cmd_setup_youtube)
+
+    export = sub.add_parser("export-liked", help="Export and normalize YouTube Music liked songs")
+    export.add_argument("--limit", default="all", help="'all' or a number. Use 25 for a smoke test.")
+    export.add_argument("--out-dir", default=str(DEFAULT_OUT_DIR), help="Output directory")
+    export.set_defaults(func=cmd_export_liked)
+
+    sync = sub.add_parser("sync", help="Sync a raw export to Last.fm")
+    sync.add_argument("--export", default=str(DEFAULT_OUT_DIR / "ytmusic_likes.raw.json"), help="Raw ytmusic export JSON")
+    sync.add_argument("--state", default=str(DEFAULT_STATE), help="SQLite checkpoint DB")
+    sync.add_argument("--apply", action="store_true", help="Actually call Last.fm track.love")
+    sync.add_argument("--sleep", type=float, default=0.35, help="Delay between Last.fm writes")
+    sync.add_argument("--max-tracks", type=int, default=0, help="Limit tracks processed")
+    sync.add_argument("--preview", type=int, default=25, help="Dry-run preview count")
+    sync.set_defaults(func=cmd_sync)
+    return root
+
+
+def main():
+    args = parser().parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
