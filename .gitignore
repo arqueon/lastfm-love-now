@@ -1,0 +1,4 @@
+lastfm-love.env
+*.local
+*.secret
+.env
