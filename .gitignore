@@ -5,3 +5,4 @@ lastfm-love.env
 __pycache__/
 *.pyc
 exports/
+.venv/

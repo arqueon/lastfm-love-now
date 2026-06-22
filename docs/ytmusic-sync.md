@@ -21,11 +21,13 @@ Last.fm can return rate limit error `29`. The sync command defaults to a `0.35s`
 
 ## Setup
 
-Install Python dependencies:
+Install the scripts:
 
 ```bash
-python3 -m pip install --user -r requirements.txt
+./install.sh
 ```
+
+`ytm-lastfm-sync` is an `uv run --script` executable, so `uv` will install `ytmusicapi` in an isolated environment the first time it runs. This avoids writing into the system Python on distributions that enforce PEP 668.
 
 Save YouTube OAuth client credentials in the existing config:
 

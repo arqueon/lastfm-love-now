@@ -10,7 +10,7 @@ Small Bash helper for Last.fm. It checks the track currently marked as `nowplayi
 - `md5sum`
 - `notify-send` for desktop notifications, optional
 - `xdg-open` for the interactive setup browser step, optional
-- Python 3.10+ and `ytmusicapi` for YouTube Music import, optional
+- `uv` for YouTube Music import, optional. The sync helper uses inline script dependencies.
 
 ## Install
 
@@ -101,7 +101,6 @@ The config file contains API secrets and a Last.fm session key. Keep it out of G
 There is an optional Python helper for exporting YouTube Music liked songs and syncing them to Last.fm loved tracks:
 
 ```bash
-python3 -m pip install --user -r requirements.txt
 ./install.sh
 ~/.config/niri/scripts/ytm-lastfm-sync setup-youtube
 ytmusicapi oauth ~/.config/niri/scripts/ytmusic-oauth.json
